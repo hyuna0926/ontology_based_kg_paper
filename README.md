@@ -3,4 +3,4 @@
 ## 📂 Dataset
 
 You can access the dataset used in this paper from the following link:  
-[Download Dataset]
+[Download Dataset](https://huggingface.co/datasets/zzin/IndusSpec-QA)
