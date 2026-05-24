@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+
 import os
 import re
 import json
@@ -8,32 +8,37 @@ from typing import List, Dict, Tuple
 from functools import lru_cache
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
+
 from dotenv import load_dotenv
 from neo4j import GraphDatabase
 from sentence_transformers import SentenceTransformer
+
 from langchain_openai import ChatOpenAI
 from langchain.schema import SystemMessage, HumanMessage, AIMessage
 from langchain_community.cache import InMemoryCache
 from langchain.globals import set_llm_cache
 
 
-# Load environment variables
 load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-NEO4J_URI = os.getenv("NEO4J_URI")
-NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
+NEO4J_URI      = os.getenv("NEO4J_URI")
+NEO4J_USER     = os.getenv("NEO4J_USER", "neo4j")
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD")
 
 if not OPENAI_API_KEY or not NEO4J_URI or not NEO4J_PASSWORD:
-    raise RuntimeError("Please set OPENAI_API_KEY / NEO4J_URI / NEO4J_PASSWORD in your .env file.")
+    raise RuntimeError("환경변수 OPENAI_API_KEY / NEO4J_URI / NEO4J_PASSWORD 를 .env에 설정하세요.")
 
-# Initialize models and drivers
+
 set_llm_cache(InMemoryCache())
-chat = ChatOpenAI(model="gpt-4o-mini", api_key=OPENAI_API_KEY)
-driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD), max_connection_pool_size=50)
 
-# Load pre-computed entity embeddings
-with open("path/to/your_entity_embeddings.pkl", "rb") as f:
+
+chat = ChatOpenAI(model="gpt-5-mini", api_key=OPENAI_API_KEY)
+
+driver = GraphDatabase.driver(
+    NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD), max_connection_pool_size=50
+)
+
+with open("/Users/jiin/Desktop/IDSL/project/서울 AI 허브 공동연구/mindmap/MindMap/entity_embedding/API_2W_entity_embeddings.pkl", "rb") as f:
     entity_data = pickle.load(f)
 
 ENTITY_LIST: List[str] = entity_data["entities"]
@@ -41,23 +46,20 @@ ENTITY_EMB = np.array(entity_data["embeddings"], dtype=np.float32)
 ENTITY_EMB /= (np.linalg.norm(ENTITY_EMB, axis=1, keepdims=True) + 1e-12)
 ENTITY_LIST_LOWER = [e.lower() for e in ENTITY_LIST]
 
-# Sentence embedding model
 embedder = SentenceTransformer("all-MiniLM-L6-v2")
-
 
 def _encode_normalized(texts: List[str], batch_size: int = 64) -> np.ndarray:
     embs = embedder.encode(texts, convert_to_numpy=True, batch_size=batch_size)
     norms = np.linalg.norm(embs, axis=1, keepdims=True) + 1e-12
     return embs / norms
 
-
 def _cosine_topk_batch(q_embs: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
+    """정규화된 q_embs와 ENTITY_EMB 간 코사인 유사도 top-k 인덱스(부분정렬) 반환"""
     sims = np.dot(q_embs, ENTITY_EMB.T)                        # (B, N)
     part = np.argpartition(sims, -k, axis=1)[:, -k:]           # (B, k)
     rows = np.arange(sims.shape[0])[:, None]
     sorted_idx = np.argsort(sims[rows, part], axis=1)[:, ::-1] # k개 내림차순
     return part[rows, sorted_idx], sims                        # (B,k), (B,N)
-
 
 @lru_cache(maxsize=10000)
 def extract_entities_by_llm(question: str) -> List[str]:
@@ -102,8 +104,6 @@ def _match_one(ent: str, top_k=5, sim_threshold=0.70) -> List[str]:
             out.append(ENTITY_LIST[i])
     return out
 
-
-
 def match_entities_to_kg(entities: List[str], top_k=5, sim_threshold=0.70) -> List[str]:
     if not entities:
         return []
@@ -124,9 +124,12 @@ def match_entities_to_kg(entities: List[str], top_k=5, sim_threshold=0.70) -> Li
             for i in idxs[r]:
                 if sims[r, i] >= sim_threshold:
                     matched.append(ENTITY_LIST[i])
+
+    # LRU 캐시 경로도 활용
     for ent in entities:
         matched.extend(_match_one(ent, top_k, sim_threshold))
 
+    # 순서 보존 중복 제거
     seen, out = set(), []
     for m in matched:
         if m not in seen:
@@ -138,9 +141,12 @@ def ensure_indexes():
         "CREATE INDEX entitylocal_label IF NOT EXISTS FOR (e:EntityLocal) ON (e.label)",
         "CREATE INDEX doc_id IF NOT EXISTS FOR (d:Doc) ON (d.id)"
     ]
-    with driver.session() as sess:
-        for c in cyphers:
-            sess.run(c)
+    try:
+        with driver.session() as sess:
+            for c in cyphers:
+                sess.run(c)
+    except Exception:
+        pass  # 권한 없는 환경이면 무시
 
 def deduplicate_context_titles(titles: List[str]) -> List[str]:
     seen, out = set(), []
@@ -171,12 +177,7 @@ def get_entity_context_bulk(entities: List[str], doc_id: str) -> List[str]:
     with driver.session() as sess:
         return [r["title"] for r in sess.run(cypher, ents=entities, doc_id=doc_id) if r["title"]]
 
-
-SYSTEM_PROMPT = """You are an expert in technical standard documents.
-Answer only based on the given evidence.
-Reply with a concise factual answer or 'I don't know' if not found.
-"""
-
+#--------------추가
 from itertools import combinations
 
 def safe_label(node):
@@ -312,12 +313,27 @@ Rules:
 def final_answer(question: str, path_evidence: str, neighbor_evidence: str) -> str:
     if not path_evidence and not neighbor_evidence:
         return "I don't know"
+
     messages = [
         SystemMessage(content=SYSTEM_PROMPT),
-        HumanMessage(content="Question: " + question),
-        AIMessage(content="Evidence:\n\n" + (path_evidence or "") + "\n\n" + (neighbor_evidence or "")),
-        HumanMessage(content="Now provide ONLY the final answer.")
+
+        HumanMessage(content=f"""
+Question: {question}
+
+You are given structured ontology evidence.
+
+[PATH EVIDENCE]
+{path_evidence}
+
+[ONTOLOGY RULES + RELATIONS]
+{neighbor_evidence}
+
+Use PATH for reasoning, RULES for constraints, RELATIONS for support.
+
+Now provide ONLY the final answer.
+""")
     ]
+
     output = chat.invoke(messages).content.strip()
     return output.splitlines()[0] if output else ""
 
@@ -329,17 +345,17 @@ def process_one_item(qa: Dict, doc_id: str) -> Dict:
     unans      = qa.get("unanswerable", False)
 
     try:
-        # 1) 엔티티 추출
+        # 1) 엔티티 추출(캐시)
         ents = extract_entities_by_llm(question)
         if not ents:
             return _pack_out(qid, question, gold, "", qtype, unans, [], [], "", [])
 
-        # 2) 엔티티 매칭
+        # 2) 엔티티 매칭(배치·캐시)
         matched = match_entities_to_kg(ents, top_k=5, sim_threshold=0.70)
         if not matched:
             return _pack_out(qid, question, gold, "", qtype, unans, ents, [], "", [])
 
-        # 3) 컨텍스트 타이틀
+        # 3) 컨텍스트 타이틀(배치)
         context_titles = deduplicate_context_titles(get_entity_context_bulk(matched, doc_id))
 
         # 4) 이웃 탐색
@@ -351,14 +367,33 @@ def process_one_item(qa: Dict, doc_id: str) -> Dict:
 
         # 4-2) 엔티티 쌍 최단경로 path evidence
         paths = find_all_entity_paths(matched, doc_id, max_paths=3)
-        path_evidence = "\n".join(paths)
+        # 1. Path evidence 구조화
+        path_evidence = "\n".join([
+            f"[PATH {i+1}] {p}"
+            for i, p in enumerate(paths)
+        ])
 
-        # 5) Evidence 문자열
+        # 2. Table (ontology rule) 분리
+        table_evidence = [
+            f"[RULE] IF {t.get('condition')} "
+            f"(CASE: {t.get('case')}) "
+            f"THEN {t.get('consequence')}"
+            for t in triples if t["type"] == "table"
+        ]
+
+        # 3. Relation (graph edge) 분리
+        relation_evidence = [
+            f"[REL] {t.get('subj')} --{t.get('edge')}--> {t.get('obj')}"
+            for t in triples if t["type"] == "text"
+        ]
+
+        # 4. Semantic relevance 상위만 사용 (노이즈 제거)
+        relation_evidence = relation_evidence[:30]
+
+        # 5. 최종 구조화된 evidence
         neighbor_evidence = "\n".join(
-            [f"{t.get('condition','')} -> {t.get('consequence','')} (case: {t.get('case','')})"
-            if t["type"] == "table"
-            else f"{t.get('subj','')} {t.get('edge','')} {t.get('obj','')}"
-            for t in triples]
+            ["=== ONTOLOGY RULES ==="] + table_evidence[:20] +
+            ["\n=== GRAPH RELATIONS ==="] + relation_evidence
         )
 
         # 6) 최종 답변
@@ -369,8 +404,21 @@ def process_one_item(qa: Dict, doc_id: str) -> Dict:
     except Exception as e:
         return _pack_out(
             qid, question, gold, "", qtype, unans,
-            [], [], "", "", [], error=str(e)
+            [], [], "", [],   # ← 여기 반드시 이렇게!
+            error=str(e)
         )
+def load_processed_ids(output_path):
+    if not os.path.exists(output_path):
+        return set()
+
+    ids = set()
+    with open(output_path, "r") as f:
+        for line in f:
+            try:
+                ids.add(json.loads(line)["id"])
+            except:
+                continue
+    return ids
 
 def _pack_out(qid, question, gold, pred, qtype, unans,
               ents, matched, path_evidence, triples, error: str = None) -> Dict:
@@ -403,25 +451,43 @@ def run_qa_dataset(input_path: str, output_path: str, doc_id: str, limit: int = 
 
     with open(input_path, "r") as f:
         qa_lines = f.readlines()
+
     if limit:
         qa_lines = qa_lines[:limit]
 
-    qa_items = [json.loads(line) for line in qa_lines if line.strip()]
+    processed_ids = load_processed_ids(output_path)
 
-    with ThreadPoolExecutor(max_workers=max_workers) as ex, open(output_path, "w") as fout:
+    qa_items = []
+    for line in qa_lines:
+        if not line.strip():
+            continue
+        item = json.loads(line)
+        if item["id"] in processed_ids:
+            continue
+        qa_items.append(item)
+
+    print(f"🔁 Resume mode: {len(processed_ids)} already processed, {len(qa_items)} remaining")
+
+    with ThreadPoolExecutor(max_workers=max_workers) as ex, open(output_path, "a") as fout:
         futures = [ex.submit(process_one_item, qa, doc_id) for qa in qa_items]
-        for fut in tqdm(as_completed(futures), total=len(futures), desc="Running QA Dataset (parallel)"):
+
+        for fut in tqdm(as_completed(futures), total=len(futures), desc="Running QA Dataset (resume)"):
             out = fut.result()
             fout.write(json.dumps(out, ensure_ascii=False) + "\n")
             fout.flush()
 
+    print(f"Done. Newly processed: {len(qa_items)}")
 
 if __name__ == "__main__":
-    DOC_ID = "API_2W"  # "A578A578M_07", "API_2W", "A6A6M_14" API_2W_remove_pruning API_2W_remove_sameword
+    DOC_ID = "API_2W" 
     run_qa_dataset(
-        input_path="QA/type/API_2W_boolean_v2_half.jsonl",
-        output_path="output/api_boolean/API_2W_boolean_new.jsonl",
+        input_path="/Users/jiin/Desktop/IDSL/project/서울 AI 허브 공동연구/mindmap/MindMap/type/API_2W_rule.jsonl",
+        output_path="/Users/jiin/Desktop/IDSL/project/서울 AI 허브 공동연구/mindmap/output/rebutal_mindmap/API_2W_aware_3nd.jsonl",
         doc_id=DOC_ID,
         limit=None,         
         max_workers=6      
     )
+
+'''
+python mindmap_ont_aware_copy.py
+'''
